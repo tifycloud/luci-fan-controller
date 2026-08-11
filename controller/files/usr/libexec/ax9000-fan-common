@@ -1,0 +1,694 @@
+#!/bin/sh
+# Shared, POSIX/BusyBox-compatible helpers for ax9000-fan-control.
+# This file is sourced by the procd service, its status endpoint, and tests.
+
+AX9000_TAG=${AX9000_TAG:-ax9000-fan}
+AX9000_SYSFS_ROOT=${AX9000_SYSFS_ROOT:-/sys}
+AX9000_SYSINFO_ROOT=${AX9000_SYSINFO_ROOT:-/tmp/sysinfo}
+AX9000_CONFIG_FILE=${AX9000_CONFIG_FILE:-/etc/config/ax9000-fan}
+AX9000_RUNTIME_DIR=${AX9000_RUNTIME_DIR:-/var/run}
+AX9000_PIDFILE=${AX9000_PIDFILE:-$AX9000_RUNTIME_DIR/ax9000-fan-control.pid}
+AX9000_PROFILE_FILE=${AX9000_PROFILE_FILE:-$AX9000_RUNTIME_DIR/ax9000-fan-profile}
+AX9000_FAULT_FILE=${AX9000_FAULT_FILE:-$AX9000_RUNTIME_DIR/ax9000-fan-fault}
+
+# UCI defaults. Temperatures are stored in degrees Celsius in UCI and converted
+# to milli-degrees Celsius after validation.
+AX9000_ENABLED=1
+AX9000_POLL_SECONDS=5
+AX9000_HYSTERESIS_C=3
+AX9000_TEMP_WARM_C=55
+AX9000_TEMP_HOT_C=62
+AX9000_TEMP_MAX_C=70
+AX9000_PWM_COOL=110
+AX9000_PWM_WARM=160
+AX9000_PWM_HOT=210
+AX9000_PWM_MAX=255
+AX9000_ZERO_RPM_LIMIT=3
+
+AX9000_CONFIG_VALID=0
+AX9000_CONFIG_ERROR=
+AX9000_FAN_PWM=
+AX9000_FAN_RPM=
+AX9000_FAN_NAME=
+AX9000_CONTROLLER_DEVICE=
+AX9000_CONTROLLER_I2C_BUS=
+AX9000_CONTROLLER_I2C_ADDR=
+AX9000_MAX_TEMP_MC=
+AX9000_MAX_TEMP_SOURCE=
+AX9000_LAST_FAULT=
+AX9000_LAST_PROFILE=${AX9000_LAST_PROFILE:-cool}
+
+ax9000_log() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t "$AX9000_TAG" -- "$*" 2>/dev/null || true
+	elif [ "${AX9000_LOG_STDERR:-0}" = 1 ]; then
+		printf '%s\n' "$AX9000_TAG: $*" >&2
+	fi
+}
+
+ax9000_sysfs() {
+	# Print an absolute path below the overridable sysfs root. The function is
+	# intentionally tiny so fixtures can point AX9000_SYSFS_ROOT at a temp dir.
+	printf '%s/%s\n' "${AX9000_SYSFS_ROOT%/}" "$1"
+}
+
+ax9000_is_uint() {
+	case "${1:-}" in
+		''|*[!0-9]*) return 1 ;;
+		0) return 0 ;;
+		0*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+ax9000_is_temperature_mc() {
+	# Linux thermal/hwmon values are signed milli-degrees Celsius. Accept the
+	# AX9000's plausible operating envelope, including a cold start below 10 C,
+	# while rejecting common disconnected-sensor sentinels and absurd readings.
+	value=${1:-}
+	case "$value" in
+		-*)
+			magnitude=${value#-}
+			ax9000_is_uint "$magnitude" || return 1
+			;;
+		*) ax9000_is_uint "$value" || return 1 ;;
+	esac
+	[ "$value" -ge -20000 ] && [ "$value" -le 200000 ]
+}
+
+ax9000_is_in_range() {
+	value=$1
+	minimum=$2
+	maximum=$3
+	ax9000_is_uint "$value" || return 1
+	[ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ]
+}
+
+ax9000_config_option_file() {
+	# Read the first matching UCI option from a plain /etc/config file. UCI is
+	# preferred below when available; this parser keeps the daemon useful in
+	# initramfs/fixtures where the uci binary is not present.
+	file=$1
+	option_name=$2
+	[ -r "$file" ] || return 1
+
+	awk -v wanted="$option_name" '
+		/^[[:space:]]*option[[:space:]]+/ {
+			line=$0
+			sub(/^[[:space:]]*option[[:space:]]+/, "", line)
+			name=line
+			sub(/[[:space:]].*$/, "", name)
+			if (name != wanted) next
+			value=line
+			sub(/^[^[:space:]]+[[:space:]]+/, "", value)
+			sub(/^[[:space:]]+/, "", value)
+			sub(/[[:space:]]+$/, "", value)
+			if (value ~ /^".*"$/ || value ~ /^'"'"'.*'"'"'$/)
+				value=substr(value, 2, length(value)-2)
+			found=1
+			print value
+			exit
+		}
+		END { if (!found) exit 1 }
+	' "$file"
+}
+
+ax9000_config_option_uci() {
+	option_name=$1
+	command -v uci >/dev/null 2>&1 || return 1
+	# The shipped config uses the named "main" section. The anonymous form is
+	# tried as a compatibility fallback for user-edited configurations.
+	if value=$(uci -q get "ax9000-fan.main.$option_name" 2>/dev/null); then
+		printf '%s\n' "$value"
+		return 0
+	fi
+	if value=$(uci -q get "ax9000-fan.@ax9000_fan[0].$option_name" 2>/dev/null); then
+		printf '%s\n' "$value"
+		return 0
+	fi
+	return 1
+}
+
+ax9000_config_option() {
+	option_name=$1
+	value=
+	# On a normal OpenWrt system, let UCI parse section boundaries, quoting and
+	# comments. The plain-file parser is only a fallback for initramfs/tests.
+	if value=$(ax9000_config_option_uci "$option_name" 2>/dev/null); then
+		printf '%s\n' "$value"
+		return 0
+	fi
+	if [ -n "${AX9000_CONFIG_FILE:-}" ] && [ -r "$AX9000_CONFIG_FILE" ]; then
+		if value=$(ax9000_config_option_file "$AX9000_CONFIG_FILE" "$option_name" 2>/dev/null); then
+			printf '%s\n' "$value"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+ax9000_load_config() {
+	# Reset to safe defaults before reading user values. An invalid explicit
+	# value never silently becomes a default: validation fails closed instead.
+	AX9000_ENABLED=1
+	AX9000_POLL_SECONDS=5
+	AX9000_HYSTERESIS_C=3
+	AX9000_TEMP_WARM_C=55
+	AX9000_TEMP_HOT_C=62
+	AX9000_TEMP_MAX_C=70
+	AX9000_PWM_COOL=110
+	AX9000_PWM_WARM=160
+	AX9000_PWM_HOT=210
+	AX9000_PWM_MAX=255
+	AX9000_ZERO_RPM_LIMIT=3
+	AX9000_CONFIG_VALID=0
+	AX9000_CONFIG_ERROR=
+
+	for option_name in enabled poll_seconds hysteresis_c temp_warm temp_hot temp_max pwm_cool pwm_warm pwm_hot pwm_max zero_rpm_limit; do
+		if ! value=$(ax9000_config_option "$option_name" 2>/dev/null); then
+			continue
+		fi
+		if [ -z "$value" ]; then
+			AX9000_CONFIG_ERROR="$option_name must not be empty"
+			break
+		fi
+		case "$option_name" in
+			enabled) AX9000_ENABLED=$value ;;
+			poll_seconds) AX9000_POLL_SECONDS=$value ;;
+			hysteresis_c) AX9000_HYSTERESIS_C=$value ;;
+			temp_warm) AX9000_TEMP_WARM_C=$value ;;
+			temp_hot) AX9000_TEMP_HOT_C=$value ;;
+			temp_max) AX9000_TEMP_MAX_C=$value ;;
+			pwm_cool) AX9000_PWM_COOL=$value ;;
+			pwm_warm) AX9000_PWM_WARM=$value ;;
+			pwm_hot) AX9000_PWM_HOT=$value ;;
+			pwm_max) AX9000_PWM_MAX=$value ;;
+			zero_rpm_limit) AX9000_ZERO_RPM_LIMIT=$value ;;
+		esac
+	done
+
+	if [ -n "$AX9000_CONFIG_ERROR" ]; then
+		:
+	elif ! ax9000_is_in_range "$AX9000_ENABLED" 0 1; then
+		AX9000_CONFIG_ERROR='enabled must be 0 or 1'
+	elif ! ax9000_is_in_range "$AX9000_POLL_SECONDS" 1 3600; then
+		AX9000_CONFIG_ERROR='poll_seconds must be between 1 and 3600'
+	elif ! ax9000_is_in_range "$AX9000_HYSTERESIS_C" 1 20; then
+		AX9000_CONFIG_ERROR='hysteresis_c must be between 1 and 20'
+	elif ! ax9000_is_in_range "$AX9000_TEMP_WARM_C" 30 100; then
+		AX9000_CONFIG_ERROR='temp_warm must be between 30 and 100 C'
+	elif ! ax9000_is_in_range "$AX9000_TEMP_HOT_C" 31 110; then
+		AX9000_CONFIG_ERROR='temp_hot must be between 31 and 110 C'
+	elif ! ax9000_is_in_range "$AX9000_TEMP_MAX_C" 32 120; then
+		AX9000_CONFIG_ERROR='temp_max must be between 32 and 120 C'
+	elif [ "$AX9000_TEMP_WARM_C" -ge "$AX9000_TEMP_HOT_C" ]; then
+		AX9000_CONFIG_ERROR='temperature thresholds must be strictly increasing'
+	elif [ "$AX9000_TEMP_HOT_C" -ge "$AX9000_TEMP_MAX_C" ]; then
+		AX9000_CONFIG_ERROR='temperature thresholds must be strictly increasing'
+	elif [ "$((AX9000_TEMP_HOT_C - AX9000_TEMP_WARM_C))" -lt "$AX9000_HYSTERESIS_C" ]; then
+		AX9000_CONFIG_ERROR='hot and warm thresholds must be separated by hysteresis_c'
+	elif [ "$((AX9000_TEMP_MAX_C - AX9000_TEMP_HOT_C))" -lt "$AX9000_HYSTERESIS_C" ]; then
+		AX9000_CONFIG_ERROR='max and hot thresholds must be separated by hysteresis_c'
+	elif ! ax9000_is_in_range "$AX9000_PWM_COOL" 1 255; then
+		AX9000_CONFIG_ERROR='pwm_cool must be between 1 and 255'
+	elif ! ax9000_is_in_range "$AX9000_PWM_WARM" 1 255; then
+		AX9000_CONFIG_ERROR='pwm_warm must be between 1 and 255'
+	elif ! ax9000_is_in_range "$AX9000_PWM_HOT" 1 255; then
+		AX9000_CONFIG_ERROR='pwm_hot must be between 1 and 255'
+	elif ! ax9000_is_in_range "$AX9000_PWM_MAX" 255 255; then
+		# A lower max would make a controller failure unable to select full
+		# drive, so it is deliberately not accepted.
+		AX9000_CONFIG_ERROR='pwm_max must be exactly 255 for fail-safe operation'
+	elif [ "$AX9000_PWM_COOL" -gt "$AX9000_PWM_WARM" ] || [ "$AX9000_PWM_WARM" -gt "$AX9000_PWM_HOT" ] || [ "$AX9000_PWM_HOT" -gt "$AX9000_PWM_MAX" ]; then
+		AX9000_CONFIG_ERROR='PWM values must be monotonically increasing'
+	elif ! ax9000_is_in_range "$AX9000_ZERO_RPM_LIMIT" 1 60; then
+		AX9000_CONFIG_ERROR='zero_rpm_limit must be between 1 and 60'
+	fi
+
+	if [ -n "$AX9000_CONFIG_ERROR" ]; then
+		AX9000_LAST_FAULT=config_error
+		return 1
+	fi
+
+	AX9000_TEMP_WARM_MC=$((AX9000_TEMP_WARM_C * 1000))
+	AX9000_TEMP_HOT_MC=$((AX9000_TEMP_HOT_C * 1000))
+	AX9000_TEMP_MAX_MC=$((AX9000_TEMP_MAX_C * 1000))
+	AX9000_HYSTERESIS_MC=$((AX9000_HYSTERESIS_C * 1000))
+	AX9000_CONFIG_VALID=1
+	return 0
+}
+
+ax9000_find_fan() {
+	AX9000_FAN_PWM=
+	AX9000_FAN_RPM=
+	AX9000_FAN_NAME=
+	AX9000_CONTROLLER_DEVICE=
+	AX9000_CONTROLLER_I2C_BUS=
+	AX9000_CONTROLLER_I2C_ADDR=
+	for hwmon in "$(ax9000_sysfs class/hwmon)/"hwmon*; do
+		# Do not carry a rejected candidate's controller coordinates into the
+		# next hwmon node. Identity is established only after the resolved
+		# device path passes the strict I2C-client gate below.
+		AX9000_CONTROLLER_DEVICE=
+		AX9000_CONTROLLER_I2C_BUS=
+		AX9000_CONTROLLER_I2C_ADDR=
+		[ -f "$hwmon/name" ] || continue
+		name=$(sed -n '1p' "$hwmon/name" 2>/dev/null || true)
+		[ "$name" = emc2305 ] || continue
+		device_link=
+		if [ "${AX9000_SKIP_DEVICE_IDENTITY:-0}" != 1 ]; then
+			device_link=$(readlink -f "$hwmon/device" 2>/dev/null || true)
+			[ -n "$device_link" ] || continue
+			AX9000_CONTROLLER_DEVICE=$device_link
+			ax9000_controller_i2c_coordinates || continue
+		fi
+		[ -e "$hwmon/pwm1" ] || continue
+		[ -w "$hwmon/pwm1" ] || continue
+		AX9000_FAN_PWM=$hwmon/pwm1
+		[ -e "$hwmon/fan1_input" ] && AX9000_FAN_RPM=$hwmon/fan1_input
+		AX9000_FAN_NAME=$name
+		AX9000_CONTROLLER_DEVICE=$device_link
+		return 0
+	done
+	return 1
+}
+
+ax9000_fan_set_pwm() {
+	value=$1
+	ax9000_is_in_range "$value" 0 255 || return 1
+	[ -n "$AX9000_FAN_PWM" ] && [ -w "$AX9000_FAN_PWM" ] || return 1
+	tries=0
+	while [ "$tries" -lt 3 ]; do
+		if printf '%s\n' "$value" > "$AX9000_FAN_PWM" 2>/dev/null; then
+			return 0
+		fi
+		tries=$((tries + 1))
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep 1
+	done
+	return 1
+}
+
+ax9000_fan_full_speed() {
+	if [ -z "$AX9000_FAN_PWM" ] || [ ! -w "$AX9000_FAN_PWM" ]; then
+		AX9000_FAN_PWM=
+		AX9000_FAN_RPM=
+		ax9000_find_fan >/dev/null 2>&1 || return 1
+	fi
+	if ax9000_fan_set_pwm 255 && [ "$(ax9000_read_pwm 2>/dev/null || true)" = 255 ]; then
+		return 0
+	fi
+	# hwmon numbering may change after a driver rebind. Rediscover once rather
+	# than trusting a stale path during the fail-safe path.
+	AX9000_FAN_PWM=
+	AX9000_FAN_RPM=
+	ax9000_find_fan >/dev/null 2>&1 || return 1
+	ax9000_fan_set_pwm 255 && [ "$(ax9000_read_pwm 2>/dev/null || true)" = 255 ]
+}
+
+ax9000_tachometer_ready() {
+	[ -n "$AX9000_FAN_RPM" ] && [ -r "$AX9000_FAN_RPM" ]
+}
+
+ax9000_relative_sysfs_path() {
+	path=$1
+	root=${AX9000_SYSFS_ROOT%/}/
+	case "$path" in
+		"$root"*) printf '%s\n' "${path#"$root"}" ;;
+		*) printf '%s\n' "$path" ;;
+	esac
+}
+
+ax9000_read_max_temp() {
+	maximum=0
+	maximum_source=
+	found=0
+	# Thermal zones are considered first, then hwmon inputs. The max value is
+	# used so a warm CPU/SoC sensor cannot be hidden by a cooler zone.
+	for sensor in "$(ax9000_sysfs class/thermal)/"thermal_zone*/temp "$(ax9000_sysfs class/hwmon)/"hwmon*/temp*_input; do
+		[ -r "$sensor" ] || continue
+		value=$(sed -n '1p' "$sensor" 2>/dev/null || true)
+		ax9000_is_temperature_mc "$value" || continue
+		if [ "$found" -eq 0 ] || [ "$value" -gt "$maximum" ]; then
+			maximum=$value
+			maximum_source=$(ax9000_relative_sysfs_path "$sensor")
+			found=1
+		fi
+	done
+	[ "$found" -eq 1 ] || return 1
+	AX9000_MAX_TEMP_MC=$maximum
+	AX9000_MAX_TEMP_SOURCE=$maximum_source
+	printf '%s\n' "$maximum"
+}
+
+ax9000_read_rpm() {
+	[ -n "$AX9000_FAN_RPM" ] && [ -r "$AX9000_FAN_RPM" ] || return 1
+	value=$(sed -n '1p' "$AX9000_FAN_RPM" 2>/dev/null || true)
+	ax9000_is_uint "$value" || return 1
+	printf '%s\n' "$value"
+}
+
+ax9000_fan_rpm_ready() {
+	# A just-bound hwmon node can report zero briefly while the fan starts. Give
+	# it a bounded spin-up window, but never declare prepare successful without
+	# a positive numeric tachometer value.
+	tries=0
+	while [ "$tries" -lt 10 ]; do
+		if rpm=$(ax9000_read_rpm 2>/dev/null) && [ "$rpm" -gt 0 ]; then
+			return 0
+		fi
+		tries=$((tries + 1))
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep 1
+	done
+	return 1
+}
+
+ax9000_read_pwm() {
+	[ -n "$AX9000_FAN_PWM" ] && [ -r "$AX9000_FAN_PWM" ] || return 1
+	value=$(sed -n '1p' "$AX9000_FAN_PWM" 2>/dev/null || true)
+	ax9000_is_uint "$value" || return 1
+	[ "$value" -le 255 ] || return 1
+	printf '%s\n' "$value"
+}
+
+ax9000_select_profile() {
+	# Hysteresis is stateful: once a higher profile is selected, temperature
+	# must fall below that profile's threshold minus hysteresis before stepping
+	# down. Upward transitions remain immediate at their configured thresholds.
+	temperature=$1
+	case "$AX9000_LAST_PROFILE" in
+		cool)
+			if [ "$temperature" -ge "$AX9000_TEMP_MAX_MC" ]; then
+				AX9000_LAST_PROFILE=max
+			elif [ "$temperature" -ge "$AX9000_TEMP_HOT_MC" ]; then
+				AX9000_LAST_PROFILE=hot
+			elif [ "$temperature" -ge "$AX9000_TEMP_WARM_MC" ]; then
+				AX9000_LAST_PROFILE=warm
+			else
+				AX9000_LAST_PROFILE=cool
+			fi
+			;;
+		warm)
+			if [ "$temperature" -ge "$AX9000_TEMP_MAX_MC" ]; then
+				AX9000_LAST_PROFILE=max
+			elif [ "$temperature" -ge "$AX9000_TEMP_HOT_MC" ]; then
+				AX9000_LAST_PROFILE=hot
+			elif [ "$temperature" -lt "$((AX9000_TEMP_WARM_MC - AX9000_HYSTERESIS_MC))" ]; then
+				AX9000_LAST_PROFILE=cool
+			else
+				AX9000_LAST_PROFILE=warm
+			fi
+			;;
+		hot)
+			if [ "$temperature" -ge "$AX9000_TEMP_MAX_MC" ]; then
+				AX9000_LAST_PROFILE=max
+			elif [ "$temperature" -lt "$((AX9000_TEMP_HOT_MC - AX9000_HYSTERESIS_MC))" ]; then
+				if [ "$temperature" -ge "$AX9000_TEMP_WARM_MC" ]; then
+					AX9000_LAST_PROFILE=warm
+				else
+					AX9000_LAST_PROFILE=cool
+				fi
+			else
+				AX9000_LAST_PROFILE=hot
+			fi
+			;;
+		max)
+			if [ "$temperature" -lt "$((AX9000_TEMP_MAX_MC - AX9000_HYSTERESIS_MC))" ]; then
+				if [ "$temperature" -ge "$AX9000_TEMP_HOT_MC" ]; then
+					AX9000_LAST_PROFILE=hot
+				elif [ "$temperature" -ge "$AX9000_TEMP_WARM_MC" ]; then
+					AX9000_LAST_PROFILE=warm
+				else
+					AX9000_LAST_PROFILE=cool
+				fi
+			else
+				AX9000_LAST_PROFILE=max
+			fi
+			;;
+		*)
+			AX9000_LAST_PROFILE=cool
+			ax9000_select_profile "$temperature"
+			;;
+	esac
+}
+
+ax9000_pwm_for_profile() {
+	case "$1" in
+		cool) printf '%s\n' "$AX9000_PWM_COOL" ;;
+		warm) printf '%s\n' "$AX9000_PWM_WARM" ;;
+		hot) printf '%s\n' "$AX9000_PWM_HOT" ;;
+		max) printf '%s\n' "$AX9000_PWM_MAX" ;;
+		*) return 1 ;;
+	esac
+}
+
+ax9000_board_name() {
+	if [ -n "${AX9000_BOARD:-}" ]; then
+		printf '%s\n' "$AX9000_BOARD"
+		return 0
+	fi
+	if [ -r "$AX9000_SYSINFO_ROOT/board_name" ]; then
+		sed -n '1p' "$AX9000_SYSINFO_ROOT/board_name"
+		return 0
+	fi
+	if [ -r /proc/device-tree/compatible ]; then
+		board=$(tr '\000' '\n' < /proc/device-tree/compatible | sed -n '/^xiaomi,ax9000\(-darkyun\)\{0,1\}$/p' | sed -n '1p')
+		[ -n "$board" ] || return 1
+		printf '%s\n' "$board"
+		return 0
+	fi
+	return 1
+}
+
+ax9000_supported_board() {
+	case "${1:-}" in
+		xiaomi,ax9000|xiaomi,ax9000-darkyun) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+ax9000_controller_i2c_coordinates() {
+	# A bound I2C client's resolved sysfs path must be rooted below devices/ and
+	# have the exact fixed EMC2301/2305 topology: i2c-<bus>/<bus>-002f. This
+	# keeps arbitrary hwmon symlinks from being mistaken for the controller.
+	device=${AX9000_CONTROLLER_DEVICE:-}
+	root_devices=$(readlink -f "${AX9000_SYSFS_ROOT%/}/devices" 2>/dev/null || true)
+	[ -n "$root_devices" ] && [ -d "$root_devices" ] || return 1
+	root=${root_devices%/}/
+	case "$device" in
+		"$root"*) ;;
+		*) return 1 ;;
+	esac
+	base=${device##*/}
+	case "$base" in
+		*-002f) bus=${base%-002f} ;;
+		*) return 1 ;;
+	esac
+	case "$bus" in ''|*[!0-9]*) return 1 ;; esac
+	parent=${device%/*}
+	parent_base=${parent##*/}
+	case "$parent_base" in
+		i2c-*) parent_bus=${parent_base#i2c-} ;;
+		*) return 1 ;;
+	esac
+	case "$parent_bus" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$parent_bus" = "$bus" ] || return 1
+	[ -d "$device" ] || return 1
+	[ -r "$device/name" ] || return 1
+	controller_name=$(sed -n '1p' "$device/name" 2>/dev/null || true)
+	case "$controller_name" in emc2301|emc2305) ;; *) return 1 ;; esac
+	AX9000_CONTROLLER_I2C_BUS=$bus
+	AX9000_CONTROLLER_I2C_ADDR=0x002f
+	return 0
+}
+
+ax9000_controller_i2c_read() {
+	register=$1
+	i2cget_bin=${AX9000_I2CGET_BIN:-i2cget}
+	command -v "$i2cget_bin" >/dev/null 2>&1 || return 1
+	value=$("$i2cget_bin" -f -y "$AX9000_CONTROLLER_I2C_BUS" "$AX9000_CONTROLLER_I2C_ADDR" "$register" 2>/dev/null) || return 1
+	value=$(printf '%s\n' "$value" | sed -n '1p' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+	case "$value" in
+		0x*) value=${value#0x} ;;
+		*) return 1 ;;
+	esac
+	case "$value" in ''|*[!0-9a-f]*) return 1 ;; esac
+	# Canonicalize leading zeroes so 0x01 and 0x0001 compare identically.
+	while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+		value=${value#0}
+	done
+	printf '0x%s\n' "$value"
+}
+
+ax9000_controller_registers_ready() {
+	[ -n "$AX9000_CONTROLLER_I2C_BUS" ] && [ -n "$AX9000_CONTROLLER_I2C_ADDR" ] || return 1
+	reg38=$(ax9000_controller_i2c_read 0x38) || return 1
+	reg2b=$(ax9000_controller_i2c_read 0x2b) || return 1
+	[ "$reg38" = 0x18 ] && [ "$reg2b" = 0x1 ]
+}
+
+ax9000_controller_configure() {
+	# Read first. A kernel/DTS-bound controller that is already configured must
+	# not receive duplicate writes (some firmware rejects those writes even
+	# though hwmon remains fully usable).
+	if [ "$AX9000_CONTROLLER_BOUND" -eq 1 ] && ax9000_controller_registers_ready; then
+		return 0
+	fi
+
+	i2cset_bin=${AX9000_I2CSET_BIN:-i2cset}
+	command -v "$i2cset_bin" >/dev/null 2>&1 || return 1
+	write_status=0
+	"$i2cset_bin" -f -y "$AX9000_CONTROLLER_I2C_BUS" "$AX9000_CONTROLLER_I2C_ADDR" 0x38 0x18 >/dev/null 2>&1 || write_status=1
+	"$i2cset_bin" -f -y "$AX9000_CONTROLLER_I2C_BUS" "$AX9000_CONTROLLER_I2C_ADDR" 0x2b 0x01 >/dev/null 2>&1 || write_status=1
+	# Always read both registers after an attempted write. A write error or an
+	# unverifiable/mismatched readback keeps prepare in the fail-safe state.
+	ax9000_controller_registers_ready || return 1
+	[ "$write_status" -eq 0 ]
+}
+
+ax9000_controller_device_path() {
+	printf '%s\n' "$(ax9000_sysfs bus/i2c/devices/0-002f)"
+}
+
+ax9000_prepare_failure() {
+	# Preserve the last safe hardware state on every preparation failure. This
+	# is deliberately best-effort: callers still receive a failure status, while
+	# a writable hwmon path is driven back to 255 whenever possible.
+	ax9000_fan_full_speed >/dev/null 2>&1 || true
+	return 1
+}
+
+ax9000_prepare_controller() {
+	# The EMC2301 is exposed as the EMC2305 hwmon-compatible driver. Prefer an
+	# already-bound hwmon client: board numbering can move across kernels, and
+	# creating a second client at the historical 0-002f path can leave the
+	# usable controller reported as a fault. The fixed address is only a
+	# fallback for systems where no controller has been bound at all.
+	AX9000_CONTROLLER_BOUND=0
+	# First trust an already-bound, writable hwmon interface. This avoids
+	# treating a harmless "module already built in"/modprobe lookup failure as
+	# a controller fault on systems where the kernel has already done the work.
+	if ax9000_find_fan; then
+		AX9000_CONTROLLER_BOUND=1
+	elif [ "${AX9000_SKIP_CONTROLLER_INIT:-0}" != 1 ]; then
+		if command -v modprobe >/dev/null 2>&1; then
+			if ! modprobe emc2305 >/dev/null 2>&1; then
+				ax9000_prepare_failure
+				return 1
+			fi
+		fi
+		if ax9000_find_fan; then
+			AX9000_CONTROLLER_BOUND=1
+		else
+			device=$(ax9000_controller_device_path)
+			if [ ! -e "$device" ]; then
+				new_device=$(ax9000_sysfs bus/i2c/devices/i2c-0/new_device)
+				if [ ! -w "$new_device" ]; then
+					ax9000_prepare_failure
+					return 1
+				fi
+				if ! printf '%s\n' 'emc2301 0x2f' > "$new_device" 2>/dev/null; then
+					ax9000_prepare_failure
+					return 1
+				fi
+			fi
+			controller_ready=0
+			controller_tries=0
+			while [ "$controller_tries" -lt 10 ]; do
+				controller_name=$(sed -n '1p' "$device/name" 2>/dev/null || true)
+				case "$controller_name" in
+					emc2301|emc2305) controller_ready=1; break ;;
+					esac
+				controller_tries=$((controller_tries + 1))
+				[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep 1
+			 done
+			if [ "$controller_ready" -ne 1 ]; then
+				ax9000_prepare_failure
+				return 1
+			fi
+			AX9000_CONTROLLER_DEVICE=$device
+			AX9000_CONTROLLER_I2C_BUS=0
+			AX9000_CONTROLLER_I2C_ADDR=0x2f
+		fi
+	fi
+
+	# Put a discovered fan at full speed before any register validation. If a
+	# later readback fails, the failure path leaves this verified PWM in place.
+	if [ "$AX9000_CONTROLLER_BOUND" -eq 1 ]; then
+		if ! ax9000_fan_full_speed; then
+			ax9000_prepare_failure
+			return 1
+		fi
+	fi
+
+	if [ "${AX9000_SKIP_CONTROLLER_INIT:-0}" != 1 ]; then
+		if ! ax9000_controller_configure; then
+			ax9000_prepare_failure
+			return 1
+		fi
+	fi
+
+	tries=0
+	while [ "$tries" -lt 10 ]; do
+		if ax9000_find_fan; then
+			# pwm1_enable is present on some kernels and absent on others.
+				enable_path=${AX9000_FAN_PWM%/*}/pwm1_enable
+				if [ -e "$enable_path" ]; then
+					if [ ! -w "$enable_path" ]; then
+						ax9000_prepare_failure
+						return 1
+					fi
+					if ! printf '%s\n' 1 > "$enable_path" 2>/dev/null; then
+						ax9000_prepare_failure
+						return 1
+					fi
+				fi
+			if ! ax9000_fan_full_speed; then
+				ax9000_prepare_failure
+				return 1
+			fi
+			if ! ax9000_fan_rpm_ready; then
+				ax9000_prepare_failure
+				return 1
+			fi
+			return 0
+		fi
+		tries=$((tries + 1))
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep 1
+	done
+	ax9000_prepare_failure
+	return 1
+}
+
+ax9000_write_profile() {
+	profile=$1
+	if [ -d "$AX9000_RUNTIME_DIR" ] || mkdir -p "$AX9000_RUNTIME_DIR" 2>/dev/null; then
+		tmp_file=$AX9000_PROFILE_FILE.$$
+		if printf '%s\n' "$profile" > "$tmp_file" 2>/dev/null; then mv -f "$tmp_file" "$AX9000_PROFILE_FILE" 2>/dev/null || true; else rm -f "$tmp_file" 2>/dev/null || true; fi
+	fi
+}
+
+ax9000_write_fault() {
+	fault=$1
+	if [ -d "$AX9000_RUNTIME_DIR" ] || mkdir -p "$AX9000_RUNTIME_DIR" 2>/dev/null; then
+		tmp_file=$AX9000_FAULT_FILE.$$
+		if printf '%s\n' "$fault" > "$tmp_file" 2>/dev/null; then mv -f "$tmp_file" "$AX9000_FAULT_FILE" 2>/dev/null || true; else rm -f "$tmp_file" 2>/dev/null || true; fi
+	fi
+}
+
+ax9000_clear_fault() {
+	# Keep this recoverable and portable: a stale fault is useful after a
+	# crash, while a successful healthy loop explicitly clears it.
+	if [ -f "$AX9000_FAULT_FILE" ]; then
+		tmp_file=$AX9000_FAULT_FILE.$$
+		if : > "$tmp_file" 2>/dev/null; then mv -f "$tmp_file" "$AX9000_FAULT_FILE" 2>/dev/null || true; else rm -f "$tmp_file" 2>/dev/null || true; fi
+	fi
+}
+
+ax9000_json_escape() {
+	# Values passed here are short diagnostic strings; escape all JSON control
+	# characters without relying on jq (which is not part of the package deps).
+	printf '%s' "${1:-}" | sed \
+		-e 's/\\/\\\\/g' \
+		-e 's/"/\\"/g' \
+		-e 's/[[:cntrl:]]/ /g'
+}

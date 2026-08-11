@@ -1,0 +1,112 @@
+#!/bin/sh
+set -u
+
+[ "$#" -eq 0 ] || {
+	printf '%s\n' '{"service_running":false,"enabled":0,"fan_found":false,"rpm":null,"fault":true,"pwm":null,"max_temp_mC":null,"max_temp_source":null,"profile":null,"thresholds":{"hysteresis_c":3,"temp_warm":55,"temp_hot":62,"temp_max":70,"pwm_cool":110,"pwm_warm":160,"pwm_hot":210,"pwm_max":255,"zero_rpm_limit":3},"error":"unexpected arguments"}'
+	exit 1
+}
+
+COMMON=${AX9000_COMMON:-/usr/libexec/ax9000-fan-common}
+[ -r "$COMMON" ] || {
+	printf '%s\n' '{"service_running":false,"enabled":0,"fan_found":false,"rpm":null,"fault":true,"pwm":null,"max_temp_mC":null,"max_temp_source":null,"profile":null,"thresholds":{"hysteresis_c":3,"temp_warm":55,"temp_hot":62,"temp_max":70,"pwm_cool":110,"pwm_warm":160,"pwm_hot":210,"pwm_max":255,"zero_rpm_limit":3},"error":"common helper is missing"}'
+	exit 1
+}
+. "$COMMON"
+
+service_running=false
+enabled=0
+fan_found=false
+fault=false
+rpm_json=null
+pwm_json=null
+max_temp_json=null
+source_json=null
+profile_json=null
+error=
+
+pid=$(sed -n '1p' "$AX9000_PIDFILE" 2>/dev/null || true)
+if ax9000_is_uint "$pid" && [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null; then
+	cmdline=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+	case "$cmdline" in *'/usr/sbin/ax9000-fan-control'*) service_running=true ;; esac
+fi
+
+if ax9000_load_config; then
+	enabled=$AX9000_ENABLED
+else
+	fault=true
+	error=$AX9000_CONFIG_ERROR
+	# Keep the thresholds object valid JSON even when an input was non-numeric.
+	AX9000_ENABLED=0
+	AX9000_HYSTERESIS_C=3
+	AX9000_TEMP_WARM_C=55
+	AX9000_TEMP_HOT_C=62
+	AX9000_TEMP_MAX_C=70
+	AX9000_PWM_COOL=110
+	AX9000_PWM_WARM=160
+	AX9000_PWM_HOT=210
+	AX9000_PWM_MAX=255
+	AX9000_ZERO_RPM_LIMIT=3
+	AX9000_TEMP_WARM_MC=55000
+	AX9000_TEMP_HOT_MC=62000
+	AX9000_TEMP_MAX_MC=70000
+fi
+
+if ax9000_find_fan; then
+	fan_found=true
+	if rpm=$(ax9000_read_rpm 2>/dev/null); then
+		rpm_json=$rpm
+	else
+		fault=true
+		[ -n "$error" ] || error=tachometer_unavailable
+	fi
+	if pwm=$(ax9000_read_pwm 2>/dev/null); then pwm_json=$pwm; fi
+else
+	fault=true
+	[ -n "$error" ] || error=fan_not_found
+fi
+
+if ax9000_read_max_temp >/dev/null 2>&1; then
+	max_temp_json=$AX9000_MAX_TEMP_MC
+	source=$(ax9000_json_escape "$AX9000_MAX_TEMP_SOURCE")
+	source_json="\"$source\""
+	# The profile file contains the hysteresis state of the daemon. If it is
+	# unavailable (for example immediately after boot), classify the current
+	# reading conservatively from the upward thresholds.
+	if [ -r "$AX9000_PROFILE_FILE" ]; then
+		profile=$(sed -n '1p' "$AX9000_PROFILE_FILE" 2>/dev/null || true)
+	else
+		profile=cool
+		[ "$AX9000_MAX_TEMP_MC" -ge "$AX9000_TEMP_WARM_MC" ] && profile=warm
+		[ "$AX9000_MAX_TEMP_MC" -ge "$AX9000_TEMP_HOT_MC" ] && profile=hot
+		[ "$AX9000_MAX_TEMP_MC" -ge "$AX9000_TEMP_MAX_MC" ] && profile=max
+	fi
+	case "$profile" in cool|warm|hot|max) profile_json="\"$profile\"" ;; *) profile_json=null ;; esac
+else
+	fault=true
+	[ -n "$error" ] || error=no_sensor
+fi
+
+if [ -r "$AX9000_FAULT_FILE" ]; then
+	fault_text=$(sed -n '1p' "$AX9000_FAULT_FILE" 2>/dev/null || true)
+	case "$fault_text" in
+		''|disabled) ;;
+		*) fault=true; [ -n "$error" ] || error=$fault_text ;;
+	esac
+fi
+
+if [ "$fault" = true ] && [ -z "$error" ]; then
+	error=fault
+fi
+
+error_json=$(ax9000_json_escape "$error")
+printf '{"service_running":%s,"enabled":%s,"fan_found":%s,"rpm":%s,"fault":%s,"pwm":%s,"max_temp_mC":%s,"max_temp_source":%s,"profile":%s,"thresholds":{"hysteresis_c":%s,"temp_warm":%s,"temp_hot":%s,"temp_max":%s,"pwm_cool":%s,"pwm_warm":%s,"pwm_hot":%s,"pwm_max":%s,"zero_rpm_limit":%s},"error":"%s"}\n' \
+	"$service_running" "$enabled" "$fan_found" "$rpm_json" "$fault" "$pwm_json" \
+	"$max_temp_json" "$source_json" "$profile_json" "$AX9000_HYSTERESIS_C" \
+	"$AX9000_TEMP_WARM_C" "$AX9000_TEMP_HOT_C" "$AX9000_TEMP_MAX_C" \
+	"$AX9000_PWM_COOL" "$AX9000_PWM_WARM" "$AX9000_PWM_HOT" \
+	"$AX9000_PWM_MAX" "$AX9000_ZERO_RPM_LIMIT" "$error_json"
+
+# Status is intentionally machine-readable even when a fault is present. A
+# non-zero exit allows CLI callers to notice faults without breaking LuCI JSON.
+[ "$fault" = true ] && exit 1
+exit 0

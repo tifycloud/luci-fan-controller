@@ -1,0 +1,151 @@
+#!/bin/sh
+set -u
+
+COMMON=${AX9000_COMMON:-/usr/libexec/ax9000-fan-common}
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
+
+AX9000_LAST_PROFILE=
+AX9000_ZERO_RPM_COUNT=0
+AX9000_LOOP_COUNT=0
+AX9000_BOARD_VERIFIED=0
+
+ax9000_fail_safe() {
+	# This is called from EXIT and signal paths. If the hwmon path disappeared,
+	# rediscover it once; failure means the kernel/driver already owns the only
+	# remaining fail-safe mechanism and is reported by status.
+	[ "$AX9000_BOARD_VERIFIED" -eq 1 ] || return 0
+	ax9000_fan_full_speed >/dev/null 2>&1 || true
+}
+
+ax9000_remove_pid() {
+	[ -f "$AX9000_PIDFILE" ] && rm -f "$AX9000_PIDFILE"
+}
+
+ax9000_shutdown() {
+	ax9000_fail_safe
+	ax9000_remove_pid
+	exit 0
+}
+
+trap 'ax9000_fail_safe' EXIT
+trap 'ax9000_shutdown' HUP INT TERM
+
+board=$(ax9000_board_name 2>/dev/null || true)
+if ! ax9000_supported_board "$board"; then
+	ax9000_write_fault "unsupported_board:${board:-unknown}"
+	ax9000_log "refusing unsupported/unknown board '${board:-unknown}'"
+	exit 1
+fi
+AX9000_BOARD_VERIFIED=1
+
+if ! ax9000_load_config; then
+	ax9000_write_fault "config_error:${AX9000_CONFIG_ERROR}"
+	ax9000_log "invalid configuration: $AX9000_CONFIG_ERROR; forcing full speed"
+	ax9000_prepare_controller >/dev/null 2>&1 || true
+	exit 1
+fi
+
+if ! mkdir -p "$AX9000_RUNTIME_DIR" 2>/dev/null; then
+	ax9000_write_fault 'runtime_dir_error'
+	exit 1
+fi
+printf '%s\n' "$$" > "$AX9000_PIDFILE" 2>/dev/null || {
+	ax9000_write_fault 'pidfile_error'
+	exit 1
+}
+
+# Disabled is intentionally a supervised safe state. Keep verifying 100% PWM
+# instead of exiting successfully and silently losing protection if hwmon was
+# late or a write failed.
+if [ "$AX9000_ENABLED" -ne 1 ]; then
+	while :; do
+		if ax9000_prepare_controller >/dev/null 2>&1 && ax9000_fan_full_speed >/dev/null 2>&1; then
+			ax9000_write_fault 'disabled'
+		else
+			ax9000_write_fault 'disabled_fullspeed_error'
+			ax9000_log 'disabled mode could not verify full fan speed; retrying'
+		fi
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep "$AX9000_POLL_SECONDS"
+		AX9000_LOOP_COUNT=$((AX9000_LOOP_COUNT + 1))
+		if [ "${AX9000_TEST_LOOPS:-0}" -gt 0 ] && [ "$AX9000_LOOP_COUNT" -ge "$AX9000_TEST_LOOPS" ]; then
+			exit 0
+		fi
+	done
+fi
+
+# Keep retrying initial controller/tachometer discovery. This covers modules or
+# hwmon nodes that appear after procd starts without requiring manual restart.
+while :; do
+	if ax9000_prepare_controller; then
+		if ax9000_tachometer_ready; then
+			break
+		fi
+		ax9000_write_fault 'tachometer_unavailable'
+		ax9000_log 'fan tachometer is missing or unreadable; forcing full speed and retrying'
+		ax9000_fan_full_speed >/dev/null 2>&1 || true
+	else
+		ax9000_write_fault 'controller_not_found'
+		ax9000_log 'EMC2301/EMC2305 controller was not ready; retrying'
+		ax9000_fan_full_speed >/dev/null 2>&1 || true
+	fi
+	[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep "$AX9000_POLL_SECONDS"
+done
+
+AX9000_LAST_PROFILE=$(sed -n '1p' "$AX9000_PROFILE_FILE" 2>/dev/null || true)
+case "$AX9000_LAST_PROFILE" in cool|warm|hot|max) ;; *) AX9000_LAST_PROFILE=cool ;; esac
+AX9000_ZERO_RPM_COUNT=0
+ax9000_write_profile "$AX9000_LAST_PROFILE"
+ax9000_clear_fault
+
+while :; do
+	if ! ax9000_read_max_temp >/dev/null; then
+		AX9000_LAST_FAULT=no_sensor
+		ax9000_write_fault no_sensor
+		ax9000_write_profile max
+		AX9000_LAST_PROFILE=max
+		ax9000_fan_set_pwm "$AX9000_PWM_MAX" >/dev/null 2>&1 || {
+			ax9000_write_fault 'no_sensor_pwm_write_error'
+			exit 1
+		}
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep "$AX9000_POLL_SECONDS"
+	else
+		temperature=$AX9000_MAX_TEMP_MC
+		AX9000_LAST_FAULT=
+		ax9000_clear_fault
+		# A prior no-sensor interval deliberately keeps max until the first valid
+		# reading; afterwards normal hysteresis resumes from max.
+		ax9000_select_profile "$temperature"
+		requested=$(ax9000_pwm_for_profile "$AX9000_LAST_PROFILE") || exit 1
+		if ! ax9000_fan_set_pwm "$requested"; then
+			ax9000_write_fault pwm_write_error
+			exit 1
+		fi
+		ax9000_write_profile "$AX9000_LAST_PROFILE"
+
+		if rpm=$(ax9000_read_rpm 2>/dev/null); then
+			if [ "$rpm" -eq 0 ]; then
+				AX9000_ZERO_RPM_COUNT=$((AX9000_ZERO_RPM_COUNT + 1))
+			else
+				AX9000_ZERO_RPM_COUNT=0
+			fi
+			if [ "$AX9000_ZERO_RPM_COUNT" -ge "$AX9000_ZERO_RPM_LIMIT" ]; then
+				ax9000_write_fault zero_rpm
+				ax9000_log "fan tachometer remained at zero for $AX9000_ZERO_RPM_COUNT samples; forcing full speed"
+				ax9000_fan_set_pwm "$AX9000_PWM_MAX" >/dev/null 2>&1 || true
+				exit 1
+			fi
+		else
+			ax9000_write_fault tachometer_unavailable
+			ax9000_log 'fan tachometer became unreadable; forcing full speed'
+			ax9000_fan_full_speed >/dev/null 2>&1 || true
+			exit 1
+		fi
+		[ "${AX9000_NO_SLEEP:-0}" = 1 ] || sleep "$AX9000_POLL_SECONDS"
+	fi
+
+	AX9000_LOOP_COUNT=$((AX9000_LOOP_COUNT + 1))
+	if [ "${AX9000_TEST_LOOPS:-0}" -gt 0 ] && [ "$AX9000_LOOP_COUNT" -ge "$AX9000_TEST_LOOPS" ]; then
+		exit 0
+	fi
+done

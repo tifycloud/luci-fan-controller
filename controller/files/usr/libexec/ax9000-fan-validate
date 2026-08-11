@@ -1,0 +1,31 @@
+#!/bin/sh
+set -u
+
+COMMON=${AX9000_COMMON:-/usr/libexec/ax9000-fan-common}
+[ -r "$COMMON" ] || {
+	printf '%s\n' 'ax9000-fan: common helper is missing' >&2
+	exit 1
+}
+. "$COMMON"
+
+if ax9000_load_config; then
+	if [ "${1:-}" = --json ]; then
+		printf '{"valid":true,"enabled":%s,"poll_seconds":%s,"hysteresis_c":%s,"temp_warm":%s,"temp_hot":%s,"temp_max":%s,"pwm_cool":%s,"pwm_warm":%s,"pwm_hot":%s,"pwm_max":%s,"zero_rpm_limit":%s}\n' \
+			"$AX9000_ENABLED" "$AX9000_POLL_SECONDS" "$AX9000_HYSTERESIS_C" \
+			"$AX9000_TEMP_WARM_C" "$AX9000_TEMP_HOT_C" "$AX9000_TEMP_MAX_C" \
+			"$AX9000_PWM_COOL" "$AX9000_PWM_WARM" "$AX9000_PWM_HOT" \
+			"$AX9000_PWM_MAX" "$AX9000_ZERO_RPM_LIMIT"
+	else
+		printf '%s\n' 'ax9000-fan: configuration is valid'
+	fi
+	exit 0
+fi
+
+if [ "${1:-}" = --json ]; then
+	error=$(ax9000_json_escape "$AX9000_CONFIG_ERROR")
+	printf '{"valid":false,"error":"%s"}\n' "$error"
+else
+	printf 'ax9000-fan: invalid configuration: %s\n' "$AX9000_CONFIG_ERROR" >&2
+fi
+exit 1
+

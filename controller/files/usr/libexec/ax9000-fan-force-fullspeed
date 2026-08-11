@@ -1,0 +1,14 @@
+#!/bin/sh
+set -u
+
+COMMON=${AX9000_COMMON:-/usr/libexec/ax9000-fan-common}
+[ -r "$COMMON" ] || exit 1
+. "$COMMON"
+
+[ "$#" -eq 0 ] || exit 1
+board=$(ax9000_board_name 2>/dev/null || true)
+ax9000_supported_board "$board" || exit 1
+ax9000_prepare_controller || exit 1
+ax9000_fan_full_speed || exit 1
+pwm=$(ax9000_read_pwm 2>/dev/null || true)
+[ "$pwm" = 255 ]

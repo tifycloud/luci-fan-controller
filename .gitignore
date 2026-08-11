@@ -1,0 +1,11 @@
+.DS_Store
+.cache/
+dist/
+*.ipk
+*.apk
+*.ipk.sha256
+*.apk.sha256
+BUILD-INFO
+BUILD-DEPENDENCIES
+SHA256SUMS
+SOURCE-MANIFEST

@@ -1,0 +1,227 @@
+/* Keep the panel theme-neutral: Liquid, Bootstrap and the official OpenWrt
+ * themes provide the surrounding colors while these variables add readable
+ * fallbacks for older theme builds. */
+.ax9-fan-page {
+	--ax9-border: var(--border-color, rgba(127, 127, 127, .35));
+	--ax9-panel: var(--background-color, rgba(127, 127, 127, .08));
+	--ax9-muted: var(--text-color-secondary, rgba(127, 127, 127, .9));
+	--ax9-positive: var(--success-color, #2b8a57);
+	--ax9-warning: var(--warning-color, #a66b00);
+	--ax9-danger: var(--error-color, #b33939);
+	max-width: 1100px;
+	margin: 0 auto;
+	padding: 1.25rem clamp(.75rem, 2vw, 1.5rem) 2.5rem;
+	color: inherit;
+}
+
+.ax9-page-header,
+.ax9-status-heading {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 1rem;
+}
+
+.ax9-page-header {
+	margin-bottom: 1.25rem;
+}
+
+.ax9-title-block h1,
+.ax9-status-heading h2 {
+	margin: 0;
+	line-height: 1.2;
+}
+
+.ax9-title-block p:last-child {
+	max-width: 48rem;
+	margin: .55rem 0 0;
+	color: var(--ax9-muted);
+}
+
+.ax9-eyebrow {
+	margin: 0 0 .35rem;
+	font-size: .73rem;
+	font-weight: 700;
+	letter-spacing: .08em;
+	text-transform: uppercase;
+	color: var(--ax9-muted);
+}
+
+.ax9-page-actions {
+	display: flex;
+	align-items: center;
+	gap: .75rem;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+}
+
+.ax9-refresh-button {
+	min-width: 5rem;
+}
+
+.ax9-refresh-button:focus-visible,
+.ax9-fan-page button:focus-visible,
+.ax9-fan-page input:focus-visible,
+.ax9-fan-page select:focus-visible {
+	outline: 3px solid currentColor;
+	outline-offset: 2px;
+}
+
+.ax9-poll-note,
+.ax9-status-source,
+.ax9-status-profile {
+	color: var(--ax9-muted);
+	font-size: .86rem;
+}
+
+.ax9-status-panel {
+	padding: clamp(1rem, 2.5vw, 1.5rem);
+	border: 1px solid var(--ax9-border);
+	border-radius: .45rem;
+	background: var(--ax9-panel);
+}
+
+.ax9-status-heading {
+	align-items: center;
+	margin-bottom: 1rem;
+}
+
+.ax9-status-badge {
+	display: inline-flex;
+	align-items: center;
+	min-height: 2rem;
+	padding: .35rem .7rem;
+	border: 1px solid var(--ax9-border);
+	border-radius: 999px;
+	font-weight: 700;
+	white-space: nowrap;
+}
+
+.ax9-status-badge.ok {
+	border-color: var(--ax9-positive);
+	border-color: color-mix(in srgb, var(--ax9-positive) 55%, var(--ax9-border));
+	color: var(--ax9-positive);
+}
+
+.ax9-status-badge.fault,
+.ax9-status-badge.error {
+	border-color: var(--ax9-danger);
+	border-color: color-mix(in srgb, var(--ax9-danger) 55%, var(--ax9-border));
+	color: var(--ax9-danger);
+}
+
+.ax9-status-badge.missing,
+.ax9-status-badge.stopped {
+	border-color: var(--ax9-warning);
+	border-color: color-mix(in srgb, var(--ax9-warning) 55%, var(--ax9-border));
+	color: var(--ax9-warning);
+}
+
+.ax9-status-badge.loading {
+	color: var(--ax9-muted);
+}
+
+.ax9-metric-grid {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(0, 1fr));
+	gap: .7rem;
+	margin: 0;
+}
+
+.ax9-metric {
+	min-width: 0;
+	padding: .8rem;
+	border: 1px solid var(--ax9-border);
+	border-radius: .35rem;
+}
+
+.ax9-metric dt {
+	margin-bottom: .35rem;
+	font-size: .79rem;
+	color: var(--ax9-muted);
+}
+
+.ax9-metric dd {
+	margin: 0;
+	font-size: clamp(1.05rem, 2.3vw, 1.4rem);
+	font-weight: 700;
+	line-height: 1.25;
+	word-break: break-word;
+}
+
+.ax9-status-source,
+.ax9-status-profile {
+	margin: .85rem 0 0;
+}
+
+.ax9-status-profile {
+	margin-top: .3rem;
+}
+
+.ax9-status-error {
+	margin: .8rem 0 0;
+	padding: .65rem .8rem;
+	border-left: 3px solid var(--ax9-danger);
+	background: rgba(179, 57, 57, .1);
+	background: color-mix(in srgb, var(--ax9-danger) 10%, transparent);
+	color: var(--ax9-danger);
+}
+
+.ax9-config-note {
+	margin: 1.25rem 0;
+	padding: .8rem 1rem;
+	border-left: 3px solid var(--ax9-warning);
+	background: rgba(166, 107, 0, .1);
+	background: color-mix(in srgb, var(--ax9-warning) 10%, transparent);
+}
+
+.ax9-config-host .cbi-map {
+	margin-top: 0;
+}
+
+.ax9-config-host .cbi-map-descr,
+.ax9-config-host .cbi-section-descr {
+	color: var(--ax9-muted);
+}
+
+.ax9-config-host .cbi-tabmenu li a:focus-visible {
+	outline: 3px solid currentColor;
+	outline-offset: -2px;
+}
+
+@media (max-width: 800px) {
+	.ax9-metric-grid {
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+	}
+}
+
+@media (max-width: 560px) {
+	.ax9-fan-page {
+		padding-inline: .65rem;
+	}
+
+	.ax9-page-header,
+	.ax9-status-heading {
+		align-items: stretch;
+		flex-direction: column;
+	}
+
+	.ax9-page-actions {
+		justify-content: flex-start;
+	}
+
+	.ax9-metric-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.ax9-fan-page *,
+	.ax9-fan-page *::before,
+	.ax9-fan-page *::after {
+		transition-duration: 0.001ms !important;
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		scroll-behavior: auto !important;
+	}
+}

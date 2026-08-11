@@ -1,0 +1,23 @@
+AX9000 风扇 LuCI 插件
+=====================
+
+这是 `luci-app-ax9000-fan` 的生产控制面板。核心控制器包名为
+`ax9000-fan-control`，配置文件为 `/etc/config/ax9000-fan`，固定使用
+`main` section。
+
+界面只通过 rpcd 的 `file.exec` 与路径 ACL 允许的固定程序
+`/usr/libexec/ax9000-fan-status` 读取状态。状态程序无参数并返回 JSON，
+包含 `service_running`、`enabled`、`fan_found`、`rpm`、`fault`、`pwm`、
+`max_temp_mC`、`max_temp_source`、`profile`、`thresholds` 和 `error`。
+
+温度字段在 UCI 中按 °C 保存：`temp_warm` 为 30–100、`temp_hot` 为
+31–110、`temp_max` 为 32–120，且必须满足
+`temp_warm < temp_hot < temp_max`。PWM 字段保存 1–255 的原始值，必须满足
+`pwm_cool <= pwm_warm <= pwm_hot <= pwm_max`，其中 `pwm_max` 固定为 255
+以保留故障全速保护。`poll_seconds` 为 1–3600 秒，`hysteresis_c` 为
+1–20 °C，`zero_rpm_limit` 为 1–60 次。相邻温度阈值之间的差不得小于
+`hysteresis_c`。
+
+保存并应用由 LuCI 的 UCI apply 流程完成；核心 init 的 UCI reload trigger
+负责重载控制器。页面没有启动、停止、重启或直接写 PWM 的操作，也没有立即
+停转（0 PWM）快捷按钮。

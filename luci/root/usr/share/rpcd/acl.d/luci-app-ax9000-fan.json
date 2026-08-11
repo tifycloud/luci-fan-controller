@@ -1,0 +1,17 @@
+{
+  "luci-app-ax9000-fan": {
+    "description": "AX9000 fan controller dashboard and configuration",
+    "read": {
+      "uci": ["ax9000-fan"],
+      "ubus": {
+        "file": ["exec"]
+      },
+      "file": {
+        "/usr/libexec/ax9000-fan-status": ["exec"]
+      }
+    },
+    "write": {
+      "uci": ["ax9000-fan"]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+config ax9000_fan 'main'
+	option enabled '1'
+	option poll_seconds '5'
+	option hysteresis_c '3'
+	option temp_warm '55'
+	option temp_hot '62'
+	option temp_max '70'
+	option pwm_cool '110'
+	option pwm_warm '160'
+	option pwm_hot '210'
+	option pwm_max '255'
+	option zero_rpm_limit '3'
+

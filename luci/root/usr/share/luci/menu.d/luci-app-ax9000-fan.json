@@ -1,0 +1,13 @@
+{
+  "admin/system/ax9000-fan": {
+    "title": "AX9000 风扇",
+    "order": 55,
+    "action": {
+      "type": "view",
+      "path": "ax9000-fan/overview"
+    },
+    "depends": {
+      "acl": ["luci-app-ax9000-fan"]
+    }
+  }
+}
